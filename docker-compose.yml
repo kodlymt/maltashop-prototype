@@ -1,0 +1,135 @@
+# MaltaShop "place an order" prototype.
+# Start everything with:   docker compose up --build
+# Secrets come from .env (copy .env.example) - nothing sensitive is hard-coded here.
+name: maltashop
+
+x-node-service: &node-service
+  restart: unless-stopped
+  init: true                       # forwards SIGTERM so graceful shutdown runs
+  read_only: true                  # nothing in the container can be changed at run time
+  tmpfs: [/tmp]                    # scratch space held in memory only
+  networks: [front, back]
+  environment: &common-env
+    APP_ENV: local
+    APP_VERSION: ${APP_VERSION:-dev}
+    LOG_LEVEL: info
+
+x-postgres: &postgres
+  image: postgres:16-alpine
+  restart: unless-stopped
+  networks: [back]                 # databases are reachable only from the services
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
+services:
+  # ---------- message broker ----------
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:15672:15672"    # management UI, this laptop only
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [front, back]        # front only so the management UI port can be published
+
+  # ---------- one database per service (none exposed to the host) ----------
+  order-db:
+    <<: *postgres
+    environment:
+      POSTGRES_USER: order_svc
+      POSTGRES_PASSWORD: ${ORDER_DB_PASSWORD:?set ORDER_DB_PASSWORD in .env}
+      POSTGRES_DB: orders
+    volumes: [order-data:/var/lib/postgresql/data]
+
+  inventory-db:
+    <<: *postgres
+    environment:
+      POSTGRES_USER: inventory_svc
+      POSTGRES_PASSWORD: ${INVENTORY_DB_PASSWORD:?set INVENTORY_DB_PASSWORD in .env}
+      POSTGRES_DB: inventory
+    volumes: [inventory-data:/var/lib/postgresql/data]
+
+  notification-db:
+    <<: *postgres
+    environment:
+      POSTGRES_USER: notification_svc
+      POSTGRES_PASSWORD: ${NOTIFICATION_DB_PASSWORD:?set NOTIFICATION_DB_PASSWORD in .env}
+      POSTGRES_DB: notifications
+    volumes: [notification-data:/var/lib/postgresql/data]
+
+  # ---------- services ----------
+  inventory-service:
+    <<: *node-service
+    build: ./inventory-service
+    image: maltashop/inventory-service:${APP_VERSION:-dev}
+    environment:
+      <<: *common-env
+      PORT: 3002
+      DATABASE_URL: postgres://inventory_svc:${INVENTORY_DB_PASSWORD}@inventory-db:5432/inventory
+      RESERVATION_TTL_SECONDS: 900
+    ports: ["127.0.0.1:3002:3002"]
+    depends_on:
+      inventory-db: { condition: service_healthy }
+
+  notification-service:
+    <<: *node-service
+    build: ./notification-service
+    image: maltashop/notification-service:${APP_VERSION:-dev}
+    environment:
+      <<: *common-env
+      PORT: 3003
+      DATABASE_URL: postgres://notification_svc:${NOTIFICATION_DB_PASSWORD}@notification-db:5432/notifications
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672
+      SIMULATED_LEAK_KB_PER_MESSAGE: ${SIMULATED_LEAK_KB_PER_MESSAGE:-0}
+    ports: ["127.0.0.1:3003:3003"]
+    deploy:
+      resources:
+        limits: { memory: 256M }   # a leak gets this container OOM-killed, not the whole shop
+    depends_on:
+      notification-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  order-service:
+    <<: *node-service
+    build: ./order-service
+    image: maltashop/order-service:${APP_VERSION:-dev}
+    environment:
+      <<: *common-env
+      PORT: 3001
+      DATABASE_URL: postgres://order_svc:${ORDER_DB_PASSWORD}@order-db:5432/orders
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672
+      INVENTORY_URL: http://inventory-service:3002
+      HTTP_TIMEOUT_MS: 2000
+      HTTP_MAX_ATTEMPTS: 3
+    ports: ["127.0.0.1:3001:3001"]
+    deploy:
+      resources:
+        limits: { memory: 256M }
+    depends_on:
+      order-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      inventory-service: { condition: service_healthy }
+      # Local-demo start-up ordering only: the consumer declares and binds its queue before
+      # the first event is published. In production, queues are declared by infrastructure code.
+      notification-service: { condition: service_healthy }
+
+networks:
+  front:                           # services: reachable from this laptop
+    driver: bridge
+  back:                            # databases + broker traffic; no route in or out of the host
+    driver: bridge
+    internal: true
+
+volumes:
+  order-data:
+  inventory-data:
+  notification-data:

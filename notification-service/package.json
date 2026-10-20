@@ -1,0 +1,22 @@
+{
+  "name": "maltashop-notification-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MaltaShop Notification service: consumes OrderPlaced events and sends (simulated) order-confirmation emails.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "engines": { "node": ">=22" },
+  "dependencies": {
+    "amqplib": "^0.10.4",
+    "express": "^5.1.0",
+    "pg": "^8.13.0",
+    "pino": "^9.5.0"
+  },
+  "devDependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1"
+  }
+}
