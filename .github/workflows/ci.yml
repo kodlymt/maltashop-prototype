@@ -1,0 +1,139 @@
+# MaltaShop CI/CD pipeline (prototype)
+# Follows the gates from Lecture 6, fastest first; any failing stage stops the pipeline:
+#   1. Lint + unit tests (+ contract tests)   per service, in parallel
+#   2. Security gates                          committed secrets (gitleaks), vulnerable libraries (npm audit)
+#   3. Build + package ONCE                    image tagged with the commit SHA
+#   4. Integration / end-to-end tests          whole system in docker compose + smoke test
+#   5. Image scan + publish                    (main only) Trivy, then push the SAME images to GHCR
+#   6. Deploy                                  (main only) staging, then production behind a manual approval
+#                                              (continuous delivery, not continuous deployment)
+# Third-party actions are pinned to exact commit SHAs (tags can be moved by an attacker).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: "1. Lint + unit + contract tests (${{ matrix.service }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [order-service, inventory-service, notification-service]
+    defaults:
+      run:
+        working-directory: ${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ matrix.service }}/package-lock.json
+      - name: Install dependencies (locked versions)
+        run: npm ci
+      - name: Lint (syntax check)
+        run: for f in $(find src -name '*.js'); do node --check "$f"; done
+      - name: Unit and contract tests
+        run: npm test
+      - name: Dependency audit (fail on critical)
+        run: npm audit --omit=dev --audit-level=critical
+
+  secrets-scan:
+    name: "2. Secret scan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-and-e2e:
+    name: "3-4. Build once + integration/E2E tests"
+    needs: [unit, secrets-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      APP_VERSION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Create CI environment file (throw-away passwords)
+        run: cp .env.example .env && sed -i "s/^APP_VERSION=.*/APP_VERSION=${GITHUB_SHA}/" .env
+      - name: Build and package images once (tag = commit SHA)
+        run: docker compose build
+      - name: Start the full system
+        run: docker compose up -d --wait --wait-timeout 180
+      - name: End-to-end smoke test (order -> event -> notification, idempotency, compensation)
+        run: node scripts/smoke-test.mjs
+      - name: Show correlated logs
+        if: always()
+        run: docker compose logs --no-color order-service inventory-service notification-service | tail -n 200
+
+      - name: "5. Scan order-service image (fail on critical)"
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: maltashop/order-service:${{ github.sha }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: "5. Publish the tested images to GHCR (no rebuild)"
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          for svc in order-service inventory-service notification-service; do
+            docker tag maltashop/$svc:${GITHUB_SHA} ghcr.io/$OWNER/maltashop-$svc:${GITHUB_SHA}
+            docker push ghcr.io/$OWNER/maltashop-$svc:${GITHUB_SHA}
+          done
+      - name: Stop the system
+        if: always()
+        run: docker compose down -v
+
+  deploy-staging:
+    name: "6. Deploy to staging"
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-and-e2e
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Promote image SHA to staging (placeholder - no cluster in the prototype)
+        run: |
+          echo "GitOps: would commit image tag ${GITHUB_SHA} to the staging overlay of the deployment repo;"
+          echo "Argo CD in the cluster pulls the change, then a post-deploy smoke test runs."
+
+  deploy-production:
+    name: "6. Deploy to production (manual approval)"
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production   # set "Required reviewers" on this environment in GitHub
+    steps:
+      - name: Promote the SAME image SHA to production (placeholder)
+        run: |
+          echo "GitOps: would commit ${GITHUB_SHA} to the production overlay;"
+          echo "Argo Rollouts canary 5% -> 25% -> 100%, aborting automatically if checkout metrics degrade."
