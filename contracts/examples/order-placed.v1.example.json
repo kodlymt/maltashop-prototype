@@ -1,0 +1,17 @@
+{
+  "event_id": "7d1f0a52-3c1e-4a8e-9a65-1f8f2a0c9b11",
+  "event_type": "OrderPlaced",
+  "event_version": 1,
+  "occurred_at": "2026-10-14T09:30:00.000Z",
+  "correlation_id": "demo-0001",
+  "data": {
+    "order_id": "0b6c3a7e-2f4d-4c55-8a1b-9d2e6f7a8b90",
+    "customer_id": "cust-1001",
+    "total_cents": 129900,
+    "currency": "EUR",
+    "payment_ref": "psp_ch_demo",
+    "items": [
+      { "sku": "TV-55-OLED", "qty": 1, "unit_price_cents": 129900 }
+    ]
+  }
+}
